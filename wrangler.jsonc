@@ -1,17 +1,19 @@
 {
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
   "name": "jotbird-user-worker",
   "main": "src/index.ts",
-  "compatibility_date": "2024-02-24",
+  "compatibility_date": "2025-01-01",
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "jotbird_db",
-      "database_id": "REPLACE_WITH_ID_OR_LEAVE_FOR_AUTO" 
+      "database_name": "jotbird_user_db",
+      "database_id": "5355ae33-e82a-4452-8a26-17b122396c33" 
     }
   ],
   "vars": {
-    "MASTER_WORKER_URL": "https://master-hub.your-domain.com",
-    "API_KEY": "change_this_secret_key",
-    "MASTER_API_KEY": "hub_shared_secret"
+    "MASTER_WORKER_URL": "https://jotbird-master-hub.alertmorteza.workers.dev"
+  },
+  "observability": {
+    "enabled": true
   }
 }
