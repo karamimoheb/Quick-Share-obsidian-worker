@@ -1,20 +1,21 @@
 import { marked } from "marked";
 
 /**
- * JotBird User Worker - v5.4 (Full Production Version)
+ * JotBird User Worker - v5.5 (Service Binding Edition)
  * ───────────────────────────────────────────────────
  * قابلیت‌ها:
- * - مدیریت کامل Handshake با هاب (روت hub-setup)
- * - تبدیل Markdown به HTML مدرن و ریسپانسیو
+ * - حل خطای 1042 با استفاده از Service Binding (env.HUB)
+ * - Handshake هوشمند با هاب (روت hub-setup)
+ * - تبدیل Markdown به HTML مدرن و ریسپانسیو (Dark Mode)
  * - تشخیص هوشمند RTL و فونت وزیر برای متون فارسی
  * - همگام‌سازی خودکار با هاب جهانی (Hub Sync)
- * - روتر هوشمند برای جلوگیری از خطای 404 اسلش
  */
 
 export interface Env {
   DB: D1Database;
-  MASTER_WORKER_URL: string; // آدرس هاب پیش‌فرض
-  MASTER_API_KEY: string;    // کلید هاب پیش‌فرض
+  HUB: Fetcher;              // Service Binding به ورکر هاب
+  MASTER_WORKER_URL: string; // آدرس هاب (به عنوان پشتیبان)
+  MASTER_API_KEY: string;    // کلید هاب (به عنوان پشتیبان)
   API_KEY: string;           // کلید امنیتی پلاگین
 }
 
@@ -24,63 +25,64 @@ export default {
       const url = new URL(request.url);
       const method = request.method;
       
-      // روتر هوشمند: حذف اسلش‌های تکراری و انتهایی برای جلوگیری از 404
+      // روتر هوشمند: حذف اسلش‌های تکراری و انتهایی
       const path = url.pathname.replace(/\/+/g, "/").replace(/\/$/, "");
 
-      // روت عمومی مشاهده نوت (استثنا برای مسیر /p/)
+      // روت عمومی مشاهده نوت
       if (path.startsWith("/p/")) {
         return handleView(path, env);
       }
 
       const authHeader = request.headers.get("Authorization") ?? "";
 
-      // بررسی امنیت برای تمام مسیرهای API (Bearer Token)
+      // بررسی امنیت API_KEY پلاگین
       if (path.startsWith("/api/v1")) {
         if (authHeader !== `Bearer ${env.API_KEY}`) {
           return jsonResponse({ error: "Unauthorized: Invalid API Key" }, 401);
         }
       }
 
-      // ─── مدیریت مسیرها (Routing) ───
-      
-      // ۱. تنظیمات اولیه هاب از سمت پلاگین
-      if (path === "/api/v1/hub-setup" && method === "POST") {
-        return handleHubSetup(request, env);
-      }
-
-      // ۲. انتشار یا بروزرسانی نوت
-      if (path === "/api/v1/publish" && method === "POST") {
-        return handlePublish(request, env);
-      }
-
-      // ۳. حذف نوت
-      if (path === "/api/v1/delete" && method === "POST") {
-        return handleDelete(request, env);
-      }
-
-      // ۴. لیست نوت‌ها
-      if (path === "/api/v1/documents" && method === "GET") {
-        return handleList(env);
-      }
-
-      // ۵. چک کردن وضعیت سلامت و اتصال به هاب
-      if (path === "/api/v1/health" && method === "GET") {
+      // ─── Routing ───
+      if (path === "/api/v1/hub-setup" && method === "POST") return handleHubSetup(request, env);
+      if (path === "/api/v1/publish"   && method === "POST") return handlePublish(request, env);
+      if (path === "/api/v1/delete"    && method === "POST") return handleDelete(request, env);
+      if (path === "/api/v1/documents" && method === "GET")  return handleList(env);
+      if (path === "/api/v1/health"    && method === "GET") {
         const hubToken = await getSetting(env, "master_jwt");
         return jsonResponse({ 
           status: "ok", 
-          version: "5.4.0", 
-          hub_connected: !!hubToken 
+          version: "5.5.0", 
+          hub_connected: !!hubToken,
+          using_binding: !!env.HUB 
         });
       }
 
       return jsonResponse({ error: "Route not found", path }, 404);
 
     } catch (err: any) {
-      console.error("Worker Global Error:", err.message);
       return jsonResponse({ error: err.message }, 500);
     }
   },
 };
+
+// ─────────────────────────────────────────────────────────
+// ابزار مدیریت ارتباط با هاب (HUB CALLER)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * این تابع هوشمندانه تشخیص می‌دهد که از Service Binding استفاده کند یا Fetch معمولی
+ * تا مشکل Error 1042 کلادفلر حل شود.
+ */
+async function callHub(env: Env, path: string, options: RequestInit, customHubUrl?: string) {
+  if (env.HUB) {
+    // استفاده از تونل داخلی (Service Binding) - آدرس دامنه در اینجا صوری است
+    return env.HUB.fetch(`https://hub-internal${path}`, options);
+  } else {
+    // استفاده از اینترنت (Fetch معمولی)
+    const targetBase = (customHubUrl || await getSetting(env, "hub_url") || env.MASTER_WORKER_URL || "").replace(/\/+$/, "");
+    return fetch(`${targetBase}${path}`, options);
+  }
+}
 
 // ─────────────────────────────────────────────────────────
 // ۱. مدیریت اتصال به هاب (HUB SETUP)
@@ -91,42 +93,38 @@ async function handleHubSetup(request: Request, env: Env): Promise<Response> {
   const { hub_url, master_api_key, owner_id } = body;
 
   if (!hub_url || !master_api_key || !owner_id) {
-    return jsonResponse({ error: "Missing config fields: hub_url, master_api_key, or owner_id" }, 400);
+    return jsonResponse({ error: "Missing required fields" }, 400);
   }
 
   const cleanHubUrl = hub_url.replace(/\/+$/, "");
   const workerOrigin = new URL(request.url).origin;
 
-  // ذخیره تنظیمات در دیتابیس محلی کاربر
+  // ذخیره تنظیمات در D1
   await setSetting(env, "hub_url", cleanHubUrl);
   await setSetting(env, "master_api_key", master_api_key);
   await setSetting(env, "owner_id", owner_id);
 
-  // انجام Handshake با هاب برای دریافت توکن پاسپورت
   try {
-    const res = await fetch(`${cleanHubUrl}/api/v1/auth`, {
+    // درخواست پاسپورت از هاب از طریق callHub (داخلی یا خارجی)
+    const res = await callHub(env, "/api/v1/auth", {
       method: "POST",
-      headers: { 
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${master_api_key}`
-      },
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${master_api_key}` },
       body: JSON.stringify({ worker_url: workerOrigin, owner_id })
-    });
+    }, cleanHubUrl);
 
     if (!res.ok) {
       const errorMsg = await res.text();
-      return jsonResponse({ error: `Hub rejected connection: ${errorMsg}` }, res.status);
+      return jsonResponse({ error: `Hub rejected: ${errorMsg}` }, res.status);
     }
 
     const data: any = await res.json();
     if (data.token) {
       await setSetting(env, "master_jwt", data.token);
-      return jsonResponse({ success: true, message: "Connected to Hub. Passport stored." });
+      return jsonResponse({ success: true, message: "Hub connected successfully via " + (env.HUB ? "Binding" : "Fetch") });
     }
-    
-    return jsonResponse({ error: "Hub failed to provide a token" }, 500);
+    return jsonResponse({ error: "No token received" }, 500);
   } catch (e: any) {
-    return jsonResponse({ error: `Hub connection error: ${e.message}` }, 500);
+    return jsonResponse({ error: `Hub connection failed: ${e.message}` }, 500);
   }
 }
 
@@ -140,45 +138,36 @@ async function handlePublish(request: Request, env: Env): Promise<Response> {
 
   const slug = body.slug || crypto.randomUUID();
   const title = body.title || "Untitled";
-  const markdown = body.markdown || "";
   const isPublic = body.isPublic ? 1 : 0;
   const now = Date.now();
 
-  // تبدیل مارک‌دان به HTML
-  const contentHtml = await marked.parse(markdown);
-  
-  // ساخت صفحه کامل HTML با استایل‌های مدرن
-  const fullHtml = buildHtmlPage(title, contentHtml, markdown);
+  const contentHtml = await marked.parse(body.markdown || "");
+  const fullHtml = buildHtmlPage(title, contentHtml, body.markdown || "");
 
-  // ذخیره در دیتابیس D1
   await env.DB.prepare(`
     INSERT INTO posts (id, html, markdown, title, tags, folder, is_public, expire_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       html=excluded.html, markdown=excluded.markdown, title=excluded.title,
-      tags=excluded.tags, folder=excluded.folder, is_public=excluded.is_public, 
-      updated_at=excluded.updated_at
+      tags=excluded.tags, folder=excluded.folder, is_public=excluded.is_public, updated_at=excluded.updated_at
   `).bind(
-    slug, fullHtml, markdown, title, 
+    slug, fullHtml, body.markdown || "", title, 
     JSON.stringify(body.tags || []), body.folder || "", 
     isPublic, now + (Number(body.expire_days || 30) * 86400000), now
   ).run();
 
-  // همگام‌سازی با هاب در صورت عمومی بودن
   if (isPublic) {
-    const hubUrl = await getSetting(env, "hub_url") || env.MASTER_WORKER_URL;
     const ownerId = await getSetting(env, "owner_id");
     const token = await getSetting(env, "master_jwt");
 
-    if (hubUrl && ownerId && token) {
-      // ارسال در پس‌زمینه
-      fetch(`${hubUrl}/api/v1/index`, {
+    if (ownerId && token) {
+      // ارسال به هاب در پس‌زمینه (استفاده از callHub)
+      callHub(env, "/api/v1/index", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
         body: JSON.stringify({
-          slug, owner_id: ownerId, title, 
-          tags: body.tags || [], folder: body.folder || "", 
-          url: `${url.origin}/p/${slug}`, updatedAt: now
+          slug, owner_id: ownerId, title, tags: body.tags || [], 
+          folder: body.folder || "", url: `${url.origin}/p/${slug}`, updatedAt: now
         })
       });
     }
@@ -188,29 +177,7 @@ async function handlePublish(request: Request, env: Env): Promise<Response> {
 }
 
 // ─────────────────────────────────────────────────────────
-// ۳. مشاهده نوت (VIEW)
-// ─────────────────────────────────────────────────────────
-
-async function handleView(path: string, env: Env): Promise<Response> {
-  const id = path.replace("/p/", "");
-  const post = await env.DB.prepare("SELECT html, is_public, expire_at FROM posts WHERE id = ?")
-    .bind(id)
-    .first<{html: string, is_public: number, expire_at: number}>();
-  
-  if (!post) return new Response("Note Not Found", { status: 404 });
-  
-  // بررسی خصوصی بودن یا انقضا
-  if (!post.is_public || Date.now() > post.expire_at) {
-    return new Response("This note is private or has expired.", { status: 403 });
-  }
-
-  return new Response(post.html, { 
-    headers: { "Content-Type": "text/html;charset=UTF-8" } 
-  });
-}
-
-// ─────────────────────────────────────────────────────────
-// ۴. حذف نوت (DELETE)
+// ۳. حذف نوت (DELETE)
 // ─────────────────────────────────────────────────────────
 
 async function handleDelete(request: Request, env: Env): Promise<Response> {
@@ -219,94 +186,84 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
 
   await env.DB.prepare("DELETE FROM posts WHERE id = ?").bind(slug).run();
 
-  // حذف از هاب جهانی
-  const hubUrl = await getSetting(env, "hub_url");
   const ownerId = await getSetting(env, "owner_id");
   const token = await getSetting(env, "master_jwt");
 
-  if (hubUrl && ownerId && token) {
-    fetch(`${hubUrl}/api/v1/index/${ownerId}/${slug}`, {
+  if (ownerId && token) {
+    // حذف از هاب از طریق callHub
+    callHub(env, `/api/v1/index/${ownerId}/${slug}`, {
       method: "DELETE",
       headers: { "Authorization": `Bearer ${token}` }
     });
   }
 
-  return jsonResponse({ success: true, message: "Deleted locally and from Hub" });
+  return jsonResponse({ success: true, message: "Deleted locally and sync request sent to Hub" });
 }
 
 // ─────────────────────────────────────────────────────────
-// ۵. لیست نوت‌ها (LIST)
+// مشاهده و لیست (VIEW & LIST)
 // ─────────────────────────────────────────────────────────
 
+async function handleView(path: string, env: Env): Promise<Response> {
+  const id = path.replace("/p/", "");
+  const post = await env.DB.prepare("SELECT html, is_public, expire_at FROM posts WHERE id = ?").bind(id).first<{html: string, is_public: number, expire_at: number}>();
+  
+  if (!post || !post.is_public || Date.now() > post.expire_at) {
+    return new Response("Not Found or Private", { status: 404 });
+  }
+
+  return new Response(post.html, { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+}
+
 async function handleList(env: Env): Promise<Response> {
-  const { results } = await env.DB.prepare(
-    "SELECT id as slug, title, is_public, updated_at, folder FROM posts ORDER BY updated_at DESC"
-  ).all();
+  const { results } = await env.DB.prepare("SELECT id as slug, title, is_public, updated_at FROM posts ORDER BY updated_at DESC").all();
   return jsonResponse({ documents: results });
 }
 
 // ─────────────────────────────────────────────────────────
-// توابع کمکی دیتابیس (SETTINGS HELPERS)
+// توابع کمکی (HELPERS)
 // ─────────────────────────────────────────────────────────
 
-async function getSetting(env: Env, key: string): Promise<string | null> {
+async function getSetting(env: Env, key: string) {
   const res = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{value: string}>();
   return res ? res.value : null;
 }
 
-async function setSetting(env: Env, key: string, value: string): Promise<void> {
-  await env.DB.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
-    .bind(key, value).run();
+async function setSetting(env: Env, key: string, value: string) {
+  await env.DB.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key, value).run();
 }
 
-// ─────────────────────────────────────────────────────────
-// رابط کاربری (HTML BUILDER - RTL & Vazirmatn)
-// ─────────────────────────────────────────────────────────
+function jsonResponse(data: any, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 
+      "Content-Type": "application/json", 
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE"
+    }
+  });
+}
 
 function buildHtmlPage(title: string, contentHtml: string, markdown: string) {
   const isRtl = /[\u0600-\u06FF]/.test(markdown + title);
-  
   return `<!DOCTYPE html>
 <html lang="${isRtl ? 'fa' : 'en'}" dir="${isRtl ? 'rtl' : 'ltr'}">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title}</title>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>${title}</title>
   <link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet">
   <style>
-    :root {
-      --bg: #0f172a; --text: #f1f5f9; --accent: #60a5fa; --card: #1e293b; --border: #334155;
-    }
-    body {
-      font-family: 'Vazirmatn', system-ui, -apple-system, sans-serif;
-      background-color: var(--bg); color: var(--text);
-      line-height: 1.8; margin: 0; padding: 2rem 1rem;
-      display: flex; justify-content: center;
-    }
+    :root { --bg: #0f172a; --text: #f1f5f9; --accent: #60a5fa; --card: #1e293b; --border: #334155; }
+    body { font-family: 'Vazirmatn', system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.8; margin: 0; padding: 2rem 1rem; display: flex; justify-content: center; }
     .container { max-width: 800px; width: 100%; }
-    header { border-bottom: 2px solid var(--card); padding-bottom: 1.5rem; margin-bottom: 2rem; }
-    h1 { font-size: 2.2rem; color: var(--accent); margin: 0; }
-    .content { 
-      background: var(--card); padding: 2rem; border-radius: 12px; 
-      box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3); border: 1px solid var(--border);
-    }
-    .content img { max-width: 100%; border-radius: 8px; }
-    pre { 
-      background: #000; padding: 1rem; border-radius: 8px; overflow-x: auto; 
-      direction: ltr; text-align: left; border: 1px solid var(--border);
-    }
-    code { font-family: 'Fira Code', monospace; color: #fbbf24; font-size: 0.9em; }
-    blockquote { 
-      border-${isRtl ? 'right' : 'left'}: 5px solid var(--accent); 
-      margin: 1.5rem 0; padding: 0.5rem 1.5rem; background: rgba(96,165,250,0.1); 
-      font-style: italic; color: #cbd5e1;
-    }
-    footer { 
-      margin-top: 4rem; text-align: center; color: #64748b; 
-      font-size: 0.85rem; border-top: 1px solid var(--card); padding-top: 2rem; 
-    }
+    .content { background: var(--card); padding: 2.5rem; border-radius: 12px; border: 1px solid var(--border); box-shadow: 0 10px 30px rgba(0,0,0,0.4); }
+    h1 { color: var(--accent); margin-bottom: 1.5rem; }
+    pre { background: #000; padding: 1rem; border-radius: 8px; overflow-x: auto; direction: ltr; text-align: left; }
+    code { color: #fbbf24; font-family: monospace; }
+    blockquote { border-${isRtl?'right':'left'}: 5px solid var(--accent); padding: 0.5rem 1.5rem; background: rgba(96,165,250,0.1); font-style: italic; margin: 1.5rem 0; }
+    img { max-width: 100%; border-radius: 8px; }
+    footer { margin-top: 4rem; text-align: center; color: #64748b; font-size: 0.8rem; border-top: 1px solid var(--card); padding-top: 2rem; }
     a { color: var(--accent); text-decoration: none; }
-    a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -317,20 +274,4 @@ function buildHtmlPage(title: string, contentHtml: string, markdown: string) {
   </div>
 </body>
 </html>`;
-}
-
-// ─────────────────────────────────────────────────────────
-// ابزارهای کمکی (UTILITIES)
-// ─────────────────────────────────────────────────────────
-
-function jsonResponse(data: any, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 
-      "Content-Type": "application/json", 
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization"
-    }
-  });
 }
