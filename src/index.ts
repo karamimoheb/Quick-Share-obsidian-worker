@@ -1,7 +1,7 @@
 /**
-JotBird User Worker — v5.5 (Security-Hardened + Hub Binding)
-─────────────────────────────────────────────────────────
-All fixes from security review applied + Hub Binding Support.
+JotBird User Worker — v5.5 (Security-Hardened + Hub Binding + Explore Bridge)
+──────────────────────────────────────────────────────────────────────────────
+All fixes from security review applied + Hub Binding Support + Explore Bridge
 FIX-10  HTML sanitizer rebuilt as a true allowlist-based parser.
 FIX-11  ensureTablesOnce comment corrected to "once per isolate cold-start".
 FIX-12  Worker public URL read from WORKER_PUBLIC_URL env var.
@@ -9,9 +9,10 @@ FIX-13  Hub JWT stored with a comment in the D1 settings table.
 FIX-14  Hub sync/delete failures are no longer silent (sync_status).
 FIX-15  handleList parses the tags JSON column server-side.
 FIX-16  handleDeleteNote wraps SELECT + DELETE in a single D1 transaction.
-NEW     Hub Service Binding support (HUB) to solve Error 1042.
-NEW     Smart Router (path normalization).
-NEW     Hub Setup Endpoint (/api/v1/hub-setup).
+FIX-17  Service Binding support (HUB) to solve Error 1042.
+FIX-18  Smart Router (path normalization).
+FIX-19  Hub Setup Endpoint (/api/v1/hub-setup).
+FIX-20  Explore Bridge Endpoint (/api/v1/explore) for Plugin Sidebar.
 
 Environment Variables (set in wrangler.toml / CF Dashboard):
 DB                 — D1 database binding
@@ -31,11 +32,6 @@ export interface Env {
   DB: D1Database;
   HUB?: Fetcher;             // اضافه شد برای حل مشکل 1042
   MASTER_WORKER_URL: string;
-  /**
-  FIX-12: Public-facing URL of this worker.
-  Must match the URL used when provisioning the client on the Hub.
-  Falls back to MASTER_WORKER_URL when not set (not recommended).
-  */
   WORKER_PUBLIC_URL?: string;
   HUB_CLIENT_ID: string;
   HUB_CLIENT_SECRET: string;
@@ -82,6 +78,17 @@ export default {
       // اضافه کردن روت تنظیمات هاب
       if (path === "/api/v1/hub-setup" && method === "POST") {
         return handleHubSetup(request, env);
+      }
+
+      // FIX-20: Explore Bridge Endpoint for Plugin Sidebar
+      if (path === "/api/v1/explore" && method === "GET") {
+        const hubUrl = await getSetting(env, "hub_url") || env.MASTER_WORKER_URL;
+        const urlParams = new URL(request.url).searchParams;
+        
+        // فراخوانی هاب و برگرداندن پاسخ به پلاگین
+        return await callHub(env, `/api/v1/explore?${urlParams.toString()}`, {
+          method: "GET"
+        });
       }
 
       if (path === "/api/v1/publish" && method === "POST") return handlePublish(request, env, ctx);
