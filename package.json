@@ -1,9 +1,18 @@
 {
   "name": "jotbird-user-worker",
-  "version": "1.0.0",
+  "version": "1.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "type-check": "tsc --noEmit"
+  },
   "devDependencies": {
     "wrangler": "^3.0.0",
     "typescript": "^5.0.0",
     "@cloudflare/workers-types": "^4.20240101.0"
+  },
+  "dependencies": {
+    "marked": "^12.0.0"
   }
 }
