@@ -2,7 +2,7 @@
 JotBird User Worker — v5.5 (Security-Hardened + Supabase Hub Bridge)
 ──────────────────────────────────────────────────────────────────────────────
 Complete rewrite for 100% compatibility with Supabase Edge Functions Hub
-All fixes from security review applied + Supabase Hub Integration
+All fixes from security review applied + D1 SQL fix
 
 FIX-10  HTML sanitizer rebuilt as a true allowlist-based parser.
 FIX-11  ensureTablesOnce comment corrected to "once per isolate cold-start".
@@ -15,12 +15,12 @@ FIX-18  Smart Router (path normalization).
 FIX-19  Hub Setup Endpoint (/api/v1/hub-setup).
 FIX-20  Explore Bridge Endpoint (/api/v1/explore) for Plugin Sidebar.
 FIX-21  Supabase Edge Functions compatibility (apikey headers).
-FIX-22  Endpoint paths updated for Supabase (/v1-auth, /v1-index, etc.)
+FIX-22  D1 SQL statements split to avoid SQLITE_ERROR.
 
 Environment Variables (set in wrangler.toml / CF Dashboard):
 DB                 — D1 database binding
-MASTER_WORKER_URL  — Supabase Edge Functions base URL (e.g. https://PROJECT_REF.supabase.co/functions/v1)
-WORKER_PUBLIC_URL  — This worker's public URL (e.g. https://notes.example.com)
+MASTER_WORKER_URL  — Supabase Edge Functions base URL
+WORKER_PUBLIC_URL  — This worker's public URL
 HUB_CLIENT_ID      — client_id provisioned via hub /admin/provision
 HUB_CLIENT_SECRET  — client_secret from provisioning
 API_KEY            — Secret key used by the Obsidian plugin to authenticate
@@ -41,16 +41,17 @@ export interface Env {
 
 // ─────────────────────────────────────────────────────────
 // SUPABASE ANON KEY (Required for Edge Functions auth)
-// Get this from: Supabase Dashboard > Settings > API > anon public
 // ─────────────────────────────────────────────────────────
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNtZ2ptdG52d2R0dnBrbGlkZGhsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIwMjI0NjMsImV4cCI6MjA4NzU5ODQ2M30.-uFNswpgPLW_4v7EPdB5Dl5EKkl_kpwvjxGdreLiDsM";
 
 // ─────────────────────────────────────────────────────────
-// FIX-11: One-time init — runs once per isolate cold-start.
+// FIX-11 & FIX-22: One-time init with split SQL statements
 // ─────────────────────────────────────────────────────────
 let tablesReady = false;
 async function ensureTablesOnce(env: Env): Promise<void> {
   if (tablesReady) return;
+  
+  // FIX-22: Split SQL statements to avoid D1 parsing errors
   await env.DB.exec(`
     CREATE TABLE IF NOT EXISTS posts (
       id TEXT PRIMARY KEY,
@@ -63,15 +64,28 @@ async function ensureTablesOnce(env: Env): Promise<void> {
       expire_at INTEGER NOT NULL,
       updated_at INTEGER,
       sync_status TEXT DEFAULT 'pending'
-    );
+    )
+  `);
+  
+  await env.DB.exec(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_posts_updated ON posts(updated_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_posts_public ON posts(is_public, expire_at);
-    CREATE INDEX IF NOT EXISTS idx_posts_sync ON posts(sync_status);
+    )
   `);
+  
+  await env.DB.exec(`
+    CREATE INDEX IF NOT EXISTS idx_posts_updated ON posts(updated_at DESC)
+  `);
+  
+  await env.DB.exec(`
+    CREATE INDEX IF NOT EXISTS idx_posts_public ON posts(is_public, expire_at)
+  `);
+  
+  await env.DB.exec(`
+    CREATE INDEX IF NOT EXISTS idx_posts_sync ON posts(sync_status)
+  `);
+  
   tablesReady = true;
 }
 
@@ -139,7 +153,6 @@ async function getOrRefreshHubToken(env: Env, workerPublicUrl: string): Promise<
 
 async function requestNewHubToken(env: Env, workerPublicUrl: string): Promise<string | null> {
   try {
-    // FIX-22: Use Supabase Edge Functions endpoint path
     const res = await callHub(env, "/v1-auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -197,7 +210,6 @@ async function syncToHub(env: Env, data: SyncData): Promise<void> {
     url: `${data.workerPublicUrl}/p/${data.slug}`,
   });
 
-  // FIX-22: Use Supabase Edge Functions endpoint path
   let res = await callHub(env, "/v1-index", {
     method: "POST",
     headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
@@ -230,7 +242,6 @@ async function deleteFromHub(env: Env, data: { slug: string }): Promise<void> {
   const token = await getOrRefreshHubToken(env, workerPublicUrl);
   if (!token) throw new Error("Hub delete aborted: could not obtain token");
 
-  // FIX-22: Use Supabase Edge Functions endpoint path
   const res = await callHub(env, `/v1-index/${encodeURIComponent(ownerId)}/${encodeURIComponent(data.slug)}`, {
     method: "DELETE",
     headers: { "Authorization": `Bearer ${token}` }
@@ -492,7 +503,6 @@ async function handleHubSetup(request: Request, env: Env): Promise<Response> {
 
     const workerOrigin = getWorkerPublicUrl(env);
 
-    // FIX-22: Use Supabase Edge Functions endpoint path
     const res = await callHub(env, "/v1-hub-setup", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${master_api_key}` },
@@ -1013,15 +1023,6 @@ export default {
 
 /*
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REQUIRED D1 MIGRATION  (run once via wrangler d1 execute)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
--- FIX-14: Add sync_status column to existing tables
-ALTER TABLE posts ADD COLUMN sync_status TEXT DEFAULT 'pending';
-CREATE INDEX IF NOT EXISTS idx_posts_sync ON posts(sync_status);
--- Update any existing rows that are already public to 'synced'
-UPDATE posts SET sync_status = 'synced' WHERE is_public = 1;
-UPDATE posts SET sync_status = 'synced' WHERE is_public = 0;
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ENV VAR CHECKLIST  (wrangler.toml / CF Dashboard)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DB                = <d1_binding>
@@ -1030,13 +1031,5 @@ WORKER_PUBLIC_URL = "https://jotbird-user-worker.alertmorteza.workers.dev"
 HUB_CLIENT_ID     = "my-personal-worker"
 HUB_CLIENT_SECRET = "<secret from /admin/provision>"
 API_KEY           = "5355ae33-e82a-4452-8a26-786M0h3b"
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SUPABASE EDGE FUNCTIONS ENDPOINTS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-/v1-auth       → POST → Get JWT token
-/v1-index      → POST/DELETE → Sync/Delete note
-/v1-explore    → GET → Browse public notes
-/v1-hub-setup  → POST → Link User Worker to Hub
-/v1-health     → GET → Health check
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 */
